@@ -1,0 +1,145 @@
+# Post-quantum cryptography in practice: ML-KEM, ML-DSA, hybrid TLS 1.3 and post-quantum SSH
+# with the real tools, OpenSSL 3.5 and OpenSSH 10, in a lab of your own.
+#
+# Three services, and nothing else can reach them:
+#   pq    your workstation: OpenSSL 3.5 and the OpenSSH 10.0 client (Debian 13). Type
+#         docker exec pq openssl version   to start, and work in its folder /lab.
+#   tls   a TLS 1.3 server, openssl s_server on port 4433, with a certificate signed by
+#         ML-DSA-65 from a small certificate authority of its own. It offers the hybrid group
+#         X25519MLKEM768, the classical X25519 and the pure MLKEM768.
+#   sshd  an OpenSSH 10.3 server on port 2222, run as the unprivileged account abc, which
+#         lets in only the key the pq service made for you, and on port 2200 the same server
+#         set up like an old one that offers only classical key exchange (ssh legacy).
+# Try, for example:
+#   docker exec pq openssl list -tls1_3 -tls-groups
+#   docker exec pq openssl genpkey -algorithm ML-KEM-768 -out kem.pem
+#   docker exec pq sh -c "openssl s_client -connect tls:4433 -servername tls -CAfile /keys/tls-ca.crt -brief 2>&1 | grep group"
+#   docker exec pq sh -c "ssh -v sshd true 2>&1 | grep 'kex: algorithm'"
+#
+# Hand in a short report on your own copy: the TLS group agreed for three client group lists
+# of your own choosing, the public key and ciphertext sizes of ML-KEM-512 and ML-KEM-1024
+# measured with your own keys, a chain of three ML-DSA certificates (a root, an intermediate CA
+# and a server) that openssl verify accepts, and the SSH key exchange agreed when you force
+# sntrup761x25519-sha512, with a sentence on which of these connections a recording made today
+# could be broken by a future quantum computer.
+#
+# The lab has no way out to the internet and every copy is your own. Keys, certificates and
+# the server's SSH host key are made fresh when the lab starts, so nothing secret is in this
+# file; your SSH key and the TLS root certificate are kept in the named volume keys. Files you
+# make in /lab are lost when the lab stops. Not here: WireGuard with Rosenpass, which needs a
+# kernel module and network rights a lab does not have.
+
+services:
+  pq:
+    image: buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10
+    working_dir: /lab
+    volumes:
+      - keys:/keys
+    entrypoint:
+      - sh
+      - -c
+      - |
+        set -e
+        mkdir -p /lab /root/.ssh
+        cd /lab
+        test -f /keys/client || ssh-keygen -q -t ed25519 -N "" -C student@pq -f /keys/client
+        cat > /root/.ssh/config <<'CFG'
+        Host legacy
+          HostName sshd
+          Port 2200
+        Host sshd legacy
+          User abc
+          Port 2222
+          IdentityFile /keys/client
+          StrictHostKeyChecking accept-new
+          UserKnownHostsFile /dev/null
+          BatchMode yes
+          LogLevel ERROR
+        CFG
+        printf '%s\n' 'Invoice 2026-114: pay 480 pounds to the lab supplier by 30 November.' > notice.txt
+        touch /tmp/ready
+        exec sleep infinity
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/ready"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+    # Measured: under 10 MB at rest and under 20 MB while keys and certificates are made.
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+    labels:
+      lab.title: Post-quantum cryptography (OpenSSL 3.5 and OpenSSH 10)
+
+  tls:
+    image: buildpack-deps:trixie-scm@sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10
+    volumes:
+      - keys:/keys
+    expose: ["4433"]
+    entrypoint:
+      - sh
+      - -c
+      - |
+        set -e
+        mkdir -p /srv/tls
+        cd /srv/tls
+        openssl genpkey -algorithm ML-DSA-65 -out ca.key
+        openssl req -x509 -new -key ca.key -subj "/CN=Lab Root CA" -days 3650 -out ca.crt
+        openssl genpkey -algorithm ML-DSA-65 -out server.key
+        openssl req -new -key server.key -subj /CN=tls -out server.csr
+        printf 'subjectAltName=DNS:tls\n' > ext.cnf
+        openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -days 825 -extfile ext.cnf -out server.crt
+        cp ca.crt /keys/tls-ca.crt
+        exec openssl s_server -accept 4433 -cert server.crt -key server.key -groups X25519MLKEM768:X25519:MLKEM768 -www -quiet
+    healthcheck:
+      test: ["CMD", "sh", "-c", "openssl s_client -connect 127.0.0.1:4433 -brief < /dev/null"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+  sshd:
+    image: linuxserver/openssh-server:10.3_p1-r2-ls243
+    user: "911:1001"
+    volumes:
+      - keys:/keys:ro
+    expose: ["2222", "2200"]
+    entrypoint:
+      - sh
+      - -c
+      - |
+        set -e
+        mkdir -p /tmp/sshd
+        ssh-keygen -q -t ed25519 -N "" -f /tmp/sshd/host_ed25519
+        cat > /tmp/sshd/sshd_config <<'CFG'
+        Port 2222
+        HostKey /tmp/sshd/host_ed25519
+        PidFile /tmp/sshd/sshd.pid
+        AuthorizedKeysFile /keys/client.pub
+        PasswordAuthentication no
+        KbdInteractiveAuthentication no
+        StrictModes no
+        UsePAM no
+        AllowTcpForwarding no
+        X11Forwarding no
+        CFG
+        sed -e 's/^Port 2222/Port 2200/' -e 's/sshd.pid/legacy.pid/' /tmp/sshd/sshd_config > /tmp/sshd/legacy_config
+        echo 'KexAlgorithms curve25519-sha256,ecdh-sha2-nistp256' >> /tmp/sshd/legacy_config
+        /usr/sbin/sshd.pam -f /tmp/sshd/legacy_config
+        exec /usr/sbin/sshd.pam -D -e -f /tmp/sshd/sshd_config
+    healthcheck:
+      test: ["CMD", "sh", "-c", "nc -z 127.0.0.1 2222 && nc -z 127.0.0.1 2200"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+
+volumes:
+  keys:
